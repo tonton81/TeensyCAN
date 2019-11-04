@@ -21,7 +21,7 @@ void setup(void) {
   config.bus_length = 1;
   config.sample = 87.5;
   FD.setRegions(64);
-  FD.setBaudRate(config, 1, 1);
+  FD.setBaudRate(config);
   FD.onReceive(canSniff);
   FD.enableMBInterrupts();
   FD.mailboxStatus();

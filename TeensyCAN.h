@@ -6,7 +6,7 @@
 #define MAX_PAYLOAD_SIZE 200
 #define MAX_NODE_RECEIVING 8
 #define NODE_UPTIME_LIMIT 3000
-#define NODE_KEEPALIVE 500
+#define NODE_KEEPALIVE 1000
 
 struct AsyncTC {
   uint8_t node = 0;
@@ -24,9 +24,13 @@ class TeensyCAN {
     void setBus(FlexCAN_T4_Base *flexcanptr) { _flexcanPtr = flexcanptr; }
     void setID(uint8_t id) { nodeID = constrain(id, 1, 127); }
     void setNet(uint32_t net = 0x1FFC0000) { nodeNet = constrain(net, 0x40000UL, 0x1FFC0000UL); }
+    void keepAlive(uint16_t val) { _keepAlive = val; }
+    void uptimeLimit(uint16_t val) { _uptimeLimit = val; }
+    static bool isOnline(uint8_t node);
     uint8_t sendMsg(const uint8_t *array, uint16_t len, uint8_t packetid = 0, uint8_t delay_send = 0, uint32_t timeout = 500);
     static Circular_Buffer<uint8_t, (uint32_t)pow(2, ceil(log(MAX_NODE_RECEIVING) / log(2))), MAX_PAYLOAD_SIZE> storage;
     static Circular_Buffer<uint8_t, 8, MAX_PAYLOAD_SIZE> completed_frames;
+    static Circular_Buffer<uint8_t, (uint32_t)pow(2, ceil(log(MAX_NODE_RECEIVING) / log(2))), 12> activeNodes;
     static uint32_t nodeNet;
     static uint8_t nodeID;
     static void onReceive(_tC_ptr handler) { TeensyCAN::_handler = handler; }
@@ -72,13 +76,9 @@ class TeensyCAN {
     NodeFeatures SPI1;
     NodeFeatures SPI2;
 
-
-
-
-  static volatile int payload_ack_check;
-
   private:
-
+    static uint16_t _keepAlive;
+    static uint16_t _uptimeLimit;
 };
 
 extern TeensyCAN Node;

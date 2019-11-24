@@ -3,8 +3,8 @@
 #include "Arduino.h"
 #include "circular_buffer.h"
 
-#define MAX_PAYLOAD_SIZE 200
-#define MAX_NODE_RECEIVING 8
+#define MAX_PAYLOAD_SIZE 4096
+#define MAX_NODE_RECEIVING 2
 #define NODE_UPTIME_LIMIT 3000
 #define NODE_KEEPALIVE 1000
 

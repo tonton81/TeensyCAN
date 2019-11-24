@@ -76,16 +76,42 @@ void TeensyCAN::events() {
     frameFD.flags.extended = frameFD.edl = frameFD.brs = frameCAN.flags.extended = 1;
     frameFD.len = frameCAN.len = 8;
     frameFD.id = frameCAN.id = nodeNet | nodeID;
-    uint8_t frame[8] = { nodeID, _flexcanPtr->getFirstTxBoxSize(), (uint8_t)(MAX_PAYLOAD_SIZE >> 8), (uint8_t)MAX_PAYLOAD_SIZE, (uint8_t)(_uptimeLimit >> 8), (uint8_t)_uptimeLimit };
+    frameFD.seq = frameCAN.seq = 1;
 
-    if ( _flexcanPtr->isFD() ) {
-      memmove(&frameFD.buf, frame, 8);
-      _flexcanPtr->write(frameFD);
+    FlexCAN_T4_Base* _nodeBusPtr = _flexcanPtr;
+#if defined(__IMXRT1062__)
+    FlexCAN_T4_Base* _nodeBusses[3] = { _CAN1, _CAN2, _CAN3 };
+#endif
+#if defined(__MK20DX256__) || defined(__MK64FX512__) || defined(__MK66FX1M0__)
+    FlexCAN_T4_Base* _nodeBusses[2] = { _CAN0, _CAN1 };
+#endif
+
+    if ( _nodeBusPtr ) {
+      uint8_t frame[8] = { nodeID, _nodeBusPtr->getFirstTxBoxSize(), (uint8_t)(MAX_PAYLOAD_SIZE >> 8), (uint8_t)MAX_PAYLOAD_SIZE, (uint8_t)(_uptimeLimit >> 8), (uint8_t)_uptimeLimit };
+      if ( _nodeBusPtr->isFD() ) {
+        memmove(&frameFD.buf, frame, 8);
+        _nodeBusPtr->write(frameFD);
+      }
+      else {
+        memmove(&frameCAN.buf, frame, 8);
+        _nodeBusPtr->write(frameCAN);
+      }
     }
-    else {
-      memmove(&frameCAN.buf, frame, 8);
-      _flexcanPtr->write(frameCAN);
+    else { /* multibus mode */
+      for ( uint8_t i = 0; i < sizeof(_nodeBusses)/sizeof(_nodeBusses[0]); i++ ) {
+        if ( _nodeBusses[i] == nullptr ) continue;
+        uint8_t frame[8] = { nodeID, _nodeBusses[i]->getFirstTxBoxSize(), (uint8_t)(MAX_PAYLOAD_SIZE >> 8), (uint8_t)MAX_PAYLOAD_SIZE, (uint8_t)(_uptimeLimit >> 8), (uint8_t)_uptimeLimit };
+        if ( _nodeBusses[i]->isFD() ) {
+          memmove(&frameFD.buf, frame, 8);
+          _nodeBusses[i]->write(frameFD);
+        }
+        else {
+          memmove(&frameCAN.buf, frame, 8);
+          _nodeBusses[i]->write(frameCAN);
+        }
+      }
     }
+
   }
 
   if ( TeensyCAN::completed_frames.size() ) {
@@ -177,7 +203,7 @@ void TeensyCAN::events() {
 }
 
 void TeensyCAN::NodeFeatures::sendControl(const uint8_t *array, uint16_t len, uint8_t port, uint16_t packetid, uint8_t toNode, uint8_t delay_send, uint32_t timeout) {
-  delay_send = constrain(delay_send, 1U, 50U);
+  delay_send = constrain(delay_send, 0U, 50U);
   len += 7;
   uint8_t buffer[len];
   memmove(&buffer[7], &array[0], len - 7);
@@ -191,59 +217,200 @@ void TeensyCAN::NodeFeatures::sendControl(const uint8_t *array, uint16_t len, ui
   buffer[5] = packetid;
   buffer[6] = port;
 
-  uint8_t mbx_size = _flexcanPtr->getFirstTxBoxSize();
+  FlexCAN_T4_Base* _nodeBusPtr = _flexcanPtr;
 
-  if ( !toNode ) { /* global size for all nodes, downsized by smallest node message buffer capacity */
-    for ( uint16_t i = 0; i < TeensyCAN::activeNodes.size(); i++ ) {
-      static uint8_t node_scan[12] = { 0 };
-      TeensyCAN::activeNodes.peek_front(node_scan, 12, i);
-      if ( node_scan[1] < mbx_size ) mbx_size = node_scan[1];
-    }
-  }
-  else {
+#if defined(__IMXRT1062__)
+  FlexCAN_T4_Base* _nodeBusses[3] = { _CAN1, _CAN2, _CAN3 };
+#endif
+#if defined(__MK20DX256__) || defined(__MK64FX512__) || defined(__MK66FX1M0__)
+  FlexCAN_T4_Base* _nodeBusses[2] = { _CAN0, _CAN1 };
+#endif
+
+
+  if ( toNode ) {
+    uint8_t mbx_size = 8;
     uint8_t _nodeSize[12] = { toNode };
     if ( TeensyCAN::activeNodes.find(_nodeSize, 12, 0, 0, 0) ) {
+#if defined(__IMXRT1062__)
+      if ( _nodeSize[7] == 3 ) _nodeBusPtr = _CAN3;
+      else if ( _nodeSize[7] == 2 ) _nodeBusPtr = _CAN2;
+      else if ( _nodeSize[7] == 1 ) _nodeBusPtr = _CAN1;
+#endif
+#if defined(__MK20DX256__) || defined(__MK64FX512__) || defined(__MK66FX1M0__)
+      if ( _nodeSize[7] == 1 ) _nodeBusPtr = _CAN1;
+      else if ( _nodeSize[7] == 0 ) _nodeBusPtr = _CAN0;
+#endif
+      mbx_size = _nodeBusPtr->getFirstTxBoxSize();
       if ( _nodeSize[1] < mbx_size ) mbx_size = _nodeSize[1]; 
     }
-  }
 
-  uint16_t chunks = (int)ceil((float)len / (mbx_size - 2));
-  uint8_t frames[chunks][mbx_size];
+    CANFD_message_t frameFD;
+    CAN_message_t frameCAN;
+    frameFD.flags.extended = frameFD.seq = frameFD.edl = frameFD.brs = frameCAN.flags.extended = frameCAN.seq = 1;
+    frameFD.len = frameCAN.len = mbx_size;
+    uint16_t chunks = (int)ceil((float)len / (mbx_size - 2));
+    uint8_t frames[chunks][mbx_size];
 
-  for ( uint16_t i = 0; i < chunks; i++ ) {
-    if ( i < chunks - 1 ) {
-      memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (mbx_size - 2));
+    for ( uint16_t i = 0; i < chunks; i++ ) {
+      if ( i < chunks - 1 ) {
+        memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (mbx_size - 2));
+        frames[i][0] = i >> 8;
+        frames[i][1] = i;
+        continue;
+      }
+      for ( uint8_t k = (len - (i * (mbx_size - 2))) + 2; k < mbx_size; k++ ) frames[i][k] = 0xAA;
+      memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (len - (i * (mbx_size - 2))));
       frames[i][0] = i >> 8;
       frames[i][1] = i;
-      continue;
     }
-    for ( uint8_t k = (len - (i * (mbx_size - 2))) + 2; k < mbx_size; k++ ) frames[i][k] = 0xAA;
-    memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (len - (i * (mbx_size - 2))));
-    frames[i][0] = i >> 8;
-    frames[i][1] = i;
+
+    for ( uint16_t j = 0; j < chunks; j++ ) {
+      delay(delay_send);
+      if ( !j && chunks != 1 ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 5UL << 14;
+      else if ( j == ( chunks - 1 ) ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 7UL << 14;
+      else if ( j ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 6UL << 14;
+      if ( _nodeBusPtr->isFD() ) {
+        memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
+        _nodeBusPtr->write(frameFD);
+      }
+      else {
+        memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
+        _nodeBusPtr->write(frameCAN);
+      }
+    }
+    uint32_t _t = millis();
+    while ( millis() - _t < 20 ) if ( !(_nodeBusPtr->events() & 0xFFF) ) return;
   }
+  else { /* global controls */
+    if ( _nodeBusPtr ) { /* single bus selected */
+      uint8_t mbx_size = _nodeBusPtr->getFirstTxBoxSize();
+      for ( uint16_t i = 0; i < TeensyCAN::activeNodes.size(); i++ ) {
+        static uint8_t node_scan[12] = { 0 };
+        TeensyCAN::activeNodes.peek_front(node_scan, 12, i);
+        if ( node_scan[1] < mbx_size ) mbx_size = node_scan[1];
+      }
 
-  CANFD_message_t frameFD;
-  CAN_message_t frameCAN;
+      CANFD_message_t frameFD;
+      CAN_message_t frameCAN;
+      frameFD.flags.extended = frameFD.seq = frameFD.edl = frameFD.brs = frameCAN.flags.extended = frameCAN.seq = 1;
+      frameFD.len = frameCAN.len = mbx_size;
+      uint16_t chunks = (int)ceil((float)len / (mbx_size - 2));
+      uint8_t frames[chunks][mbx_size];
 
-  frameFD.flags.extended = frameFD.seq = frameFD.edl = frameFD.brs = frameCAN.flags.extended = frameCAN.seq = 1;
-  frameFD.len = frameCAN.len = mbx_size;
+      for ( uint16_t i = 0; i < chunks; i++ ) {
+        if ( i < chunks - 1 ) {
+          memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (mbx_size - 2));
+          frames[i][0] = i >> 8;
+          frames[i][1] = i;
+          continue;
+        }
+        for ( uint8_t k = (len - (i * (mbx_size - 2))) + 2; k < mbx_size; k++ ) frames[i][k] = 0xAA;
+        memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (len - (i * (mbx_size - 2))));
+        frames[i][0] = i >> 8;
+        frames[i][1] = i;
+      }
 
-  for ( uint16_t j = 0; j < chunks; j++ ) {
-    delay(delay_send);
-    if ( !j && chunks != 1 ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 5UL << 14;
-    else if ( j == ( chunks - 1 ) ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 7UL << 14;
-    else if ( j ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 6UL << 14;
-    if ( _flexcanPtr->isFD() ) {
-      memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
-      _flexcanPtr->write(frameFD);
+      for ( uint16_t j = 0; j < chunks; j++ ) {
+        delay(delay_send);
+        if ( !j && chunks != 1 ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 5UL << 14;
+        else if ( j == ( chunks - 1 ) ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 7UL << 14;
+        else if ( j ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 6UL << 14;
+        if ( _nodeBusPtr->isFD() ) {
+          memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
+          _nodeBusPtr->write(frameFD);
+        }
+        else {
+          memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
+          _nodeBusPtr->write(frameCAN);
+        }
+      }
+      uint32_t _t = millis();
+      while ( millis() - _t < 20 ) if ( !(_nodeBusPtr->events() & 0xFFF) ) return;
     }
-    else {
-      memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
-      _flexcanPtr->write(frameCAN);
+    else { /* multi bus mode */
+      for ( uint8_t i = 0; i < sizeof(_nodeBusses)/sizeof(_nodeBusses[0]); i++ ) {
+        if ( _nodeBusses[i] == nullptr ) continue;
+        uint8_t mbx_size = _nodeBusses[i]->getFirstTxBoxSize();
+        if ( _nodeBusses[i]->isFD() ) {
+          for ( uint16_t i = 0; i < TeensyCAN::activeNodes.size(); i++ ) {
+            static uint8_t node_scan[12] = { 0 };
+            TeensyCAN::activeNodes.peek_front(node_scan, 12, i);
+            if ( node_scan[1] < mbx_size ) mbx_size = node_scan[1];
+          }
+        }
+
+        CANFD_message_t frameFD;
+        CAN_message_t frameCAN;
+        frameFD.flags.extended = frameFD.seq = frameFD.edl = frameFD.brs = frameCAN.flags.extended = frameCAN.seq = 1;
+        frameFD.len = frameCAN.len = mbx_size;
+        uint16_t chunks = (int)ceil((float)len / (mbx_size - 2));
+        uint8_t frames[chunks][mbx_size];
+
+        for ( uint16_t i = 0; i < chunks; i++ ) {
+          if ( i < chunks - 1 ) {
+            memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (mbx_size - 2));
+            frames[i][0] = i >> 8;
+            frames[i][1] = i;
+            continue;
+          }
+          for ( uint8_t k = (len - (i * (mbx_size - 2))) + 2; k < mbx_size; k++ ) frames[i][k] = 0xAA;
+          memmove(&frames[i][2], &buffer[i * (mbx_size - 2)], (len - (i * (mbx_size - 2))));
+          frames[i][0] = i >> 8;
+          frames[i][1] = i;
+        }
+
+        for ( uint16_t j = 0; j < chunks; j++ ) {
+          delay(delay_send);
+          if ( !j && chunks != 1 ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 5UL << 14;
+          else if ( j == ( chunks - 1 ) ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 7UL << 14;
+          else if ( j ) frameFD.id = frameCAN.id = nodeNet | toNode << 7 | nodeID | 6UL << 14;
+          if ( _nodeBusses[i]->isFD() ) {
+            memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
+            _nodeBusses[i]->write(frameFD);
+          }
+          else {
+            memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
+            _nodeBusses[i]->write(frameCAN);
+          }
+        }
+        uint32_t _t = millis();
+        while ( millis() - _t < 20 ) if ( !(_nodeBusses[i]->events() & 0xFFF) ) return;
+      }
     }
   }
 }
+
+
+
+
+
+#ifdef fgdfjhbgdjhfbgdjhfgbdfj
+    if ( _nodeBusPtr ) {
+      if ( _nodeBusPtr->isFD() ) {
+        memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
+        _nodeBusPtr->write(frameFD);
+      }
+      else {
+        memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
+        _nodeBusPtr->write(frameCAN);
+      }
+    }
+    else { /* multibus mode */
+      for ( uint8_t i = 0; i < sizeof(_nodeBusses)/sizeof(_nodeBusses[0]); i++ ) {
+        if ( _nodeBusses[i] == nullptr ) continue;
+        if ( _nodeBusses[i]->isFD() ) {
+          memmove(&frameFD.buf[0], &frames[j][0], mbx_size);
+          _nodeBusses[i]->write(frameFD);
+        }
+        else {
+          memmove(&frameCAN.buf[0], &frames[j][0], mbx_size);
+          _nodeBusses[i]->write(frameCAN);
+        }
+      }
+    }
+#endif
+
+
 
 int TeensyCAN::NodeFeatures::available() {
   if ( !isOnline(featuredNode) ) return 0;
@@ -332,7 +499,7 @@ size_t TeensyCAN::NodeFeatures::write(const uint8_t *buf, size_t size) {
 
 uint8_t TeensyCAN::sendMsg(const uint8_t *array, uint16_t len, uint8_t packetid, uint8_t delay_send, uint32_t timeout) {
   if ( !isOnline(Serial.featuredNode) ) return 0;
-  Serial.sendControl(array, len, packetid, 65534, Serial.featuredNode);
+  Serial.sendControl(array, len, packetid, 65534, Serial.featuredNode, delay_send);
   if ( !Serial.featuredNode ) return 0; /* no responses for global calls */
   uint8_t response[MAX_PAYLOAD_SIZE] = { 0 };
   response[1] = (uint8_t)((Serial.featuredNode) + 127);
@@ -365,15 +532,16 @@ bool TeensyCAN::isOnline(uint8_t node) {
   return 1;
 }
 
-void frame_processing(uint32_t id, const uint8_t *array, uint8_t len) { /* handle CAN2.0 and CANFD data */
+void frame_processing(uint32_t id, const uint8_t *array, uint8_t len, uint8_t bus) { /* handle CAN2.0 and CANFD data */
   if ( (id & 0x1FFC0000) != TeensyCAN::nodeNet ) return; /* other frame IDs not for local nodes */
   if (((id & 0x3F80) >> 7) != TeensyCAN::nodeID && ((id & 0x3F80) >> 7)) return; /* other nodes blocked, accept only global or specific traffic */
 
   if ( ((id & 0x3C000) >> 14) == 0 ) {
     uint8_t buffer[12] = { 0 };
-    memmove(&buffer, array, 12);
+    memmove(&buffer, array, 8);
     if ( TeensyCAN::activeNodes.find(buffer, 12, 0, 0, 0) ) { /* update node on active list */
       uint32_t _millis = millis();
+      buffer[7] = bus;
       buffer[8] = ((uint8_t)(_millis >> 24));
       buffer[9] = ((uint8_t)(_millis >> 16));
       buffer[10] = ((uint8_t)(_millis >> 8));
@@ -382,6 +550,7 @@ void frame_processing(uint32_t id, const uint8_t *array, uint8_t len) { /* handl
     }
     else { /* add node to active list */
       uint32_t _millis = millis();
+      buffer[7] = bus;
       buffer[8] = ((uint8_t)(_millis >> 24));
       buffer[9] = ((uint8_t)(_millis >> 16));
       buffer[10] = ((uint8_t)(_millis >> 8));
@@ -415,7 +584,7 @@ void frame_processing(uint32_t id, const uint8_t *array, uint8_t len) { /* handl
       uint16_t checksum = 0xBEEF;
       for ( uint16_t i = 9; i < ((uint16_t)(array[2] << 8) | array[3]) + 9; i++ ) checksum ^= array[i];
       if ( checksum == ((uint16_t)(array[4] << 8) | array[5]) ) {
-        memmove(&buffer[0], &array[0], MAX_PAYLOAD_SIZE);
+        memmove(&buffer[0], &array[0], len);
         buffer[0] = (id & 0x3F80) >> 7; /* this node, or broadcast? */
         buffer[1] = (id & 0x7F) + 127; /* remote node, offset scan */
         TeensyCAN::completed_frames.push_back(buffer, MAX_PAYLOAD_SIZE);
@@ -432,9 +601,9 @@ void frame_processing(uint32_t id, const uint8_t *array, uint8_t len) { /* handl
 }
 
 void ext_outputFD3(const CANFD_message_t &msg) { /* FD frame, send to processing which handles CAN2.0 and CANFD */
-  frame_processing(msg.id, msg.buf, msg.len);
+  frame_processing(msg.id, msg.buf, msg.len, msg.bus);
 }
 
 void ext_output3(const CAN_message_t &msg) { /* CAN2.0 frame, send to processing which handles CAN2.0 and CANFD */
-  frame_processing(msg.id, msg.buf, msg.len);
+  frame_processing(msg.id, msg.buf, msg.len, msg.bus);
 }
